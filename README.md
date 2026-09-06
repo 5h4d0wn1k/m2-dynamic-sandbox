@@ -1,130 +1,108 @@
 # M2 — Dynamic Analysis Sandbox
 
-Automated malware detonation and behavioral monitoring tool for reverse engineering.
+A genuine, no-root behavioral sandbox that runs YOUR OWN crafted, non-destructive
+sample inside a throwaway temp directory and reports what it did — using nothing
+but the Python standard library and the Linux `/proc` filesystem.
 
-## Overview
+## What genuinely works
 
-This project implements a dynamic analysis sandbox that:
-- Detonates malware samples in a controlled environment
-- Monitors file system changes (created, modified, deleted files)
-- Tracks network connections and traffic
-- Monitors Windows registry modifications
-- Performs YARA scanning on artifacts
-- Extracts suspicious strings and indicators
-- Generates comprehensive JSON reports
+Real behavioral observation on real Linux hosts (offline, no privileges):
 
-## Features
+- **Spawned processes** — the sample plus any children it forks are captured by
+  walking `/proc/<pid>/task/*/children`, with `pid`, `comm`, state, full
+  `/proc/<pid>/cmdline` and CPU time per process.
+- **Created / modified / deleted files** — a SHA-256 snapshot diff of the sandbox
+  directory before vs after the run. No root, no inotify, no fanotify.
+- **Network binds & connects** — socket file-descriptors are resolved via
+  `readlink /proc/<pid>/fd/*` to `socket:[inode]` and matched against the real
+  kernel tables `/proc/net/tcp` and `/proc/net/tcp6`, yielding protocol, local
+  and remote `ip:port` and the connection state. A listener is reported as a
+  `bind`, an outbound socket as `connect`/`ESTABLISHED`/`SYN_SENT`, etc.
+- **Isolation** — the sample's cwd is the sandbox dir and `HOME`, `TMP`,
+  `TMPDIR`, `TEMPDIR` are redirected there. No executable sample leaves the
+  temp dir; stdout/stderr are captured into `stdout.txt`.
+- **JSON report** — written under the repo's gitignored `reports/` directory
+  (or the argparse `-o` directory).
 
-- **Automated Detonation**: Execute samples with configurable timeout
-- **File Monitoring**: Track filesystem changes in watch directories
-- **Network Monitoring**: Capture network connections via tcpdump
-- **Registry Monitoring**: Detect Windows registry modifications
-- **YARA Scanning**: Scan artifacts with custom YARA rules
-- **String Analysis**: Extract suspicious API calls and URLs
-- **JSON Reports**: Generate detailed analysis reports
-- **Suspicious Indicators**: Auto-detect behavioral red flags
+Dependencies: **Python 3 stdlib only** (`subprocess`, `/proc`, `struct`,
+`hashlib`, `threading`, `json`, `argparse`). No `yara-python`, no `tcpdump`,
+no `reg query`, no root.
 
-## Installation
+## Real fixture shipped
 
-```bash
-pip install yara-python
-```
+| Fixture | Behavior the sandbox observes |
+|---------|-------------------------------|
+| `firmware/benign_sample.py` | Writes two files in its cwd and binds a TCP listener on `127.0.0.1` (ephemeral port), then attempts a connection to local discard port `9`. |
+
+The fixture is clearly benign and already annotated as such.
 
 ## Usage
 
 ```bash
-# Basic analysis
-python3 sandbox.py malware_sample.exe
+# Help
+python3 firmware/sandbox.py --help
 
-# Custom timeout and output directory
-python3 sandbox.py malware_sample.exe -t 120 -o ./analysis_output
+# Run the shipped benign fixture (offline demo, exits 0)
+python3 firmware/sandbox.py
 
-# With YARA rules
-python3 sandbox.py malware_sample.exe --yara-rules ./rules/
+# Run your own crafted benign sample
+python3 firmware/sandbox.py firmware/benign_sample.py -o reports/run1 -t 10
 
-# Verbose mode
-python3 sandbox.py malware_sample.exe -v
+# Keep the sandbox dir + JSON report under reports/
+python3 firmware/sandbox.py firmware/benign_sample.py --poll 0.02 -o reports/run2
 ```
 
-## Example Output
+### Offline demo (exits 0)
 
-```
-============================================================
-  M2 — Dynamic Analysis Sandbox — Report
-============================================================
-  Sample:   ./analysis_output/sample.exe
-  SHA256:   a1b2c3d4e5f6...
-  MD5:      abc123def456...
-  Duration: 60.0s
-------------------------------------------------------------
-  Files Created:    3
-  Files Modified:   1
-  Files Deleted:    0
-  Network Events:   15
-  Registry Changes: 2
-  YARA Matches:     1
-------------------------------------------------------------
-  Created Files:
-    [+] C:\Users\user\AppData\temp\dropper.exe
-    [+] C:\Windows\Temp\config.dat
-  Network Events:
-    [TCP] 192.168.1.100 -> 185.234.72.18:443
-  Suspicious Indicators:
-    [!] File created: C:\Users\user\AppData\temp\dropper.exe
-    [!] High network activity: 15 connections
-============================================================
+```bash
+python3 firmware/sandbox.py
 ```
 
-## Architecture
+produces the observation report and writes
+`reports/sandbox/report.json` (gitignored).
 
-```
-m2-dynamic-sandbox/
-├── firmware/
-│   ├── sandbox.py          # Main sandbox implementation
-│   └── rules/              # YARA rules directory
-├── README.md
-└── requirements.txt
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
-## How It Works
+Behavioural tests run the benign fixture against the live sandbox and assert
+files, processes and the `127.0.0.1` bind are observed. On non-Linux hosts the
+`/proc` behavioural tests are skipped gracefully; helper tests always run.
 
-1. **Pre-analysis**: Compute file hashes, snapshot filesystem, start network capture
-2. **Detonation**: Execute sample with timeout, capture stdout/stderr
-3. **Post-analysis**: Detect file changes, stop network capture, check registry
-4. **YARA Scan**: Scan all created/modified files with loaded rules
-5. **Report**: Generate JSON report with all findings and indicators
+## Live Lab Test Plan
 
-## Legal Disclaimer
+1. In an isolated container/VM (no root) run `python3 firmware/sandbox.py`
+   the shipped fixture; confirm exit 0 and that the report lists the built
+   files, the sample process, and a `bind:tcp` on `127.0.0.1`.
+2. Craft your own benign sample (e.g. `python3 -c "open('x','w').write('hi')"`)
+   and confirm the created file appears with its SHA-256.
+3. Cross-check one observed socket against `ss -tlnp`/`/proc/net/tcp` while the
+   sample sleeps; the entries should agree.
+4. Only ever run samples you wrote yourself or have explicit written
+   authorization to detonate. Never detonate unknown malware outside an
+   isolated, throwaway VM.
 
-**IMPORTANT: Read before use.**
+## Metrics
 
-This project is provided for **educational and authorized security testing purposes only**.
+- Observation sources: `/proc/<pid>/task/*/children`, `/proc/<pid>/stat`,
+  `/proc/<pid>/cmdline`, `/proc/<pid>/fd` (readlink), `/proc/net/tcp`,
+  `/proc/net/tcp6`; filesystem SHA-256 snapshot diff.
+- Test count: 11 stdlib unittest cases (see `tests/`).
+- Dependencies: Python 3 stdlib only.
+- Offline demo: executes the shipped benign fixture and reports real
+  observed process/file/socket behavior.
 
-### Authorization Requirements
-- You MUST have explicit written permission from the system owner before using this tool
-- Executing malware on systems without authorization is illegal under federal and state laws
-- This tool should ONLY be used on systems you own or have written authorization to test
+## IMPORTANT: Read before use.
 
-### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **State Laws**: Many states have additional computer crime statutes
-- **GDPR/CCPA**: Data collection may be subject to privacy regulations
-
-### Acceptable Use
-- Analyzing malware in isolated lab environments
-- Authorized malware analysis with written scope
-- Academic research in controlled sandboxes
-- Security education and training
-
-### Prohibited Use
-- Detonating malware on production systems
-- Analyzing samples without proper containment
-- Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
-
-### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
+This tool is for **educational and authorized analysis only**. It executes
+files on a real operating system — you MUST only run samples you own or are
+explicitly authorized to execute, and you should run it only on systems you own
+or within an isolated throwaway lab environment. Executing malware without
+authorization may violate computer-crime laws. The repo ships only a clearly
+benign test fixture. The author is not responsible for misuse.
 
 ## License
 
-MIT
+MIT — see `LICENSE`.
